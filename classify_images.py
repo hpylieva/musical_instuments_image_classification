@@ -72,24 +72,26 @@ def imshow(inp, title=None):
     plt.imshow(inp)
     if title is not None:
         plt.title(title)
-    plt.pause(0.001)
 
 
-def load_model(model, model_file='best_model.pt'):
+def load_model(model, device, model_file='best_model.pt'):
     """
     :param model: contains an initiated model (architecture)
     :param model_file: file containing pretrained weights
     :return: model with restored trained weights
     """
     model.load_state_dict(torch.load(model_file))
-    model.eval()
+    model.to(device)
     return model
 
 
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=15):
     since = time.time()
 
-    val_acc_history = []
+    history = {'train_loss': [],
+               'train_acc': [],
+               'val_loss': [],
+               'val_acc': []}
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
@@ -140,15 +142,14 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=15):
 
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
-
             print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+            history[f'{phase}_loss'].append(epoch_loss)
+            history[f'{phase}_acc'].append(float(epoch_acc.data.cpu().numpy()))
 
             # deep copy the model
             if phase == 'val' and epoch_acc > best_acc:
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
-            if phase == 'val':
-                val_acc_history.append(epoch_acc)
 
         print()
 
@@ -159,7 +160,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=15):
     # load best model weights
     model.load_state_dict(best_model_wts)
     torch.save(model.state_dict(), 'best_model.pt')
-    return model, val_acc_history
+    return model, history
 
 
 def set_parameter_requires_grad(model, feature_extracting):
@@ -185,29 +186,67 @@ def initialize_model(model_name, num_classes, feature_extract, use_pretrained=Tr
     return model_ft, input_size
 
 
-if __name__ == '__main__':
-    model_name = 'resnet'
-    num_epochs = 25
-    batch_size = 8
-    feature_extract = True
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def visualize_model(model, target_column_name, dataloaders, class_names, num_images=8):
+    was_training = model.training
+    model.eval()
+    images_so_far = 0
+    n_rows = 2
+    n_columns = num_images // n_rows
+    fig = plt.figure(figsize=(4 * n_columns, 4.5 * n_rows))
+    ax = []
+    with torch.no_grad():
+        for i, (inputs, labels) in enumerate(dataloaders['val']):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
-    df = pd.read_excel('products.xlsx')
-    df.dropna(inplace=True, subset=['category', 'condition'])
-    target = df['category'].astype('category').cat.codes.values
-    n_classes = len(df['category'].unique())
-    ids = df['id'].values
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+
+            for j in range(inputs.size()[0]):
+                images_so_far += 1
+                ax.append(fig.add_subplot(n_rows, n_columns, images_so_far))
+                ax[-1].set_title(f'true: {class_names[labels[j]]}\npredicted: {class_names[preds[j]]}')
+
+                imshow(inputs.cpu().data[j])
+
+                if images_so_far == num_images:
+                    model.train(mode=was_training)
+                    plt.savefig(f'model_{target_column_name}_predict_result.png')
+                    plt.show()
+                    return
+        model.train(mode=was_training)
+
+
+def visualize_history(history, target_column_name):
+    plt.plot(history['train_acc'], label='Train acc')
+    plt.plot(history['train_loss'], label='Train loss')
+    plt.plot(history['val_acc'], label='Validation acc')
+    plt.plot(history['val_loss'], label='Validation loss')
+    plt.title(f'Model for {target_column_name} training history')
+    plt.legend()
+    plt.savefig(f'{target_column_name} training history.png')
+    plt.show()
+
+
+def get_model_for_target_column(df: pd.DataFrame, ids_column_name: str, target_column_name: str,
+                                model_name, num_epochs, batch_size,feature_extract, device):
+    target_series = df[target_column_name]
+    ids = df[ids_column_name].values
+    target = target_series.astype('category').cat.codes.values
+    class_names = list(target_series.unique())
+    n_classes = len(class_names)
 
     data_split = get_train_val_test_samples(ids, target)
     X = {'train': data_split[0], 'val': data_split[1], 'test': data_split[2]}
     y = {'train': data_split[3], 'val': data_split[4], 'test': data_split[5]}
 
     image_datasets = {ds_type: ImageData('.', 'img_n', X[ds_type], y[ds_type], data_transforms[ds_type])
-                        for ds_type in ['train', 'val']}
+                      for ds_type in ['train', 'val']}
 
     # Create training and validation dataloaders
     dataloaders_dict = {
-        ds_type: torch.utils.data.DataLoader(image_datasets[ds_type], batch_size=batch_size, shuffle=True, num_workers=4)
+        ds_type: torch.utils.data.DataLoader(image_datasets[ds_type], batch_size=batch_size, shuffle=True,
+                                             num_workers=4)
         for ds_type in ['train', 'val']
     }
 
@@ -233,9 +272,56 @@ if __name__ == '__main__':
     optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
     criterion = nn.CrossEntropyLoss()
 
-    # # Decay LR by a factor of 0.1 every 7 epochs
-    # exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
-    # model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
-    #                        num_epochs=n_epochs)
-    # Train and evaluate
     model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
+    print("Model was trained and saved.")
+    visualize_history(hist, target_column_name)
+    visualize_model(model_ft, target_column_name, dataloaders_dict, class_names)
+    # return model_ft, hist
+
+def load_and_test_trained_model(model_file, df: pd.DataFrame, ids_column_name: str, target_column_name: str,
+                                model_name, num_epochs, batch_size,feature_extract, device):
+    target_series = df[target_column_name]
+    ids = df[ids_column_name].values
+    target = target_series.astype('category').cat.codes.values
+    class_names = list(target_series.unique())
+    n_classes = len(class_names)
+
+    data_split = get_train_val_test_samples(ids, target)
+    X = {'train': data_split[0], 'val': data_split[1], 'test': data_split[2]}
+    y = {'train': data_split[3], 'val': data_split[4], 'test': data_split[5]}
+
+    image_datasets = {ds_type: ImageData('.', 'img_n', X[ds_type], y[ds_type], data_transforms[ds_type])
+                      for ds_type in ['train', 'val']}
+
+    # Create training and validation dataloaders
+    dataloaders_dict = {
+        ds_type: torch.utils.data.DataLoader(image_datasets[ds_type], batch_size=batch_size, shuffle=True,
+                                             num_workers=4)
+        for ds_type in ['train', 'val']
+    }
+
+    # imshow(dataloaders_dict['train'][0][0])
+
+    model_ft, input_size = initialize_model(model_name, n_classes, feature_extract, use_pretrained=False)
+    model_ft = load_model(model_ft, device, model_file)
+    visualize_model(model_ft, target_column_name, dataloaders_dict, class_names)
+
+
+if __name__ == '__main__':
+    model_name = 'resnet'
+    num_epochs = 3
+    batch_size = 8
+    feature_extract = True
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    LOAD_TRAINED_MODEL = True
+
+    df = pd.read_excel('products.xlsx')
+    df.dropna(inplace=True, subset=['category', 'condition'])
+
+    if LOAD_TRAINED_MODEL:
+        model_file = 'best_model_non_feature_extract.pt'
+        load_and_test_trained_model(model_file, df, 'id', 'category', model_name, num_epochs, batch_size, feature_extract, device)
+    else:
+        get_model_for_target_column(df, 'id', 'category', model_name, num_epochs, batch_size, feature_extract, device)
+
+
