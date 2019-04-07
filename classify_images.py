@@ -74,7 +74,7 @@ def imshow(inp, title=None):
         plt.title(title)
 
 
-def load_model(model, device, model_file='best_model.pt'):
+def load_model(model, device, model_file='best_model_condition_feature_extract.pt'):
     """
     :param model: contains an initiated model (architecture)
     :param model_file: file containing pretrained weights
@@ -159,7 +159,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=15):
 
     # load best model weights
     model.load_state_dict(best_model_wts)
-    torch.save(model.state_dict(), 'best_model.pt')
+    torch.save(model.state_dict(), 'best_model_condition_feature_extract.pt')
     return model, history
 
 
@@ -186,7 +186,7 @@ def initialize_model(model_name, num_classes, feature_extract, use_pretrained=Tr
     return model_ft, input_size
 
 
-def visualize_model(model, target_column_name, dataloaders, class_names, num_images=8):
+def visualize_model(model, dataloader, class_names, im_name, num_images=8):
     was_training = model.training
     model.eval()
     images_so_far = 0
@@ -195,7 +195,7 @@ def visualize_model(model, target_column_name, dataloaders, class_names, num_ima
     fig = plt.figure(figsize=(4 * n_columns, 4.5 * n_rows))
     ax = []
     with torch.no_grad():
-        for i, (inputs, labels) in enumerate(dataloaders['val']):
+        for i, (inputs, labels) in enumerate(dataloader):
             inputs = inputs.to(device)
             labels = labels.to(device)
 
@@ -211,7 +211,7 @@ def visualize_model(model, target_column_name, dataloaders, class_names, num_ima
 
                 if images_so_far == num_images:
                     model.train(mode=was_training)
-                    plt.savefig(f'model_{target_column_name}_predict_result.png')
+                    plt.savefig(im_name)
                     plt.show()
                     return
         model.train(mode=was_training)
@@ -230,15 +230,20 @@ def visualize_history(history, target_column_name):
 
 def get_model_for_target_column(df: pd.DataFrame, ids_column_name: str, target_column_name: str,
                                 model_name, num_epochs, batch_size,feature_extract, device):
-    target_series = df[target_column_name]
+    target_series = df[target_column_name].astype('category')
     ids = df[ids_column_name].values
-    target = target_series.astype('category').cat.codes.values
-    class_names = list(target_series.unique())
+    target = target_series.cat.codes.values
+    class_id_to_class_name = {i: name for i, name in enumerate(list(target_series.cat.categories))}
+    class_names = list(class_id_to_class_name.values())
     n_classes = len(class_names)
 
     data_split = get_train_val_test_samples(ids, target)
     X = {'train': data_split[0], 'val': data_split[1], 'test': data_split[2]}
     y = {'train': data_split[3], 'val': data_split[4], 'test': data_split[5]}
+    # save test ids and lables
+    test_class_names = [class_id_to_class_name[i] for i in y['test']]
+    pd.DataFrame({'id': X['test'], 'target': y['test'], target_column_name: test_class_names})\
+        .to_csv(f'{target_column_name}_test_sample.csv', index=False)
 
     image_datasets = {ds_type: ImageData('.', 'img_n', X[ds_type], y[ds_type], data_transforms[ds_type])
                       for ds_type in ['train', 'val']}
@@ -275,53 +280,47 @@ def get_model_for_target_column(df: pd.DataFrame, ids_column_name: str, target_c
     model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
     print("Model was trained and saved.")
     visualize_history(hist, target_column_name)
-    visualize_model(model_ft, target_column_name, dataloaders_dict, class_names)
+    visualize_model(model_ft, dataloaders_dict['val'], class_names,f'model_{target_column_name}_predict_result.png')
     # return model_ft, hist
 
-def load_and_test_trained_model(model_file, df: pd.DataFrame, ids_column_name: str, target_column_name: str,
-                                model_name, num_epochs, batch_size,feature_extract, device):
-    target_series = df[target_column_name]
-    ids = df[ids_column_name].values
-    target = target_series.astype('category').cat.codes.values
-    class_names = list(target_series.unique())
+
+def load_and_test_trained_model(model_file, num_images, ids_column_name: str, target_column_name: str,
+                                model_name, batch_size,feature_extract, device):
+    test_df = pd.read_csv(f'{target_column_name}_test_sample.csv')
+    ids = test_df[ids_column_name].values
+    y = test_df['target']
+    class_names = list(test_df[target_column_name].unique())
     n_classes = len(class_names)
 
-    data_split = get_train_val_test_samples(ids, target)
-    X = {'train': data_split[0], 'val': data_split[1], 'test': data_split[2]}
-    y = {'train': data_split[3], 'val': data_split[4], 'test': data_split[5]}
-
-    image_datasets = {ds_type: ImageData('.', 'img_n', X[ds_type], y[ds_type], data_transforms[ds_type])
-                      for ds_type in ['train', 'val']}
-
-    # Create training and validation dataloaders
-    dataloaders_dict = {
-        ds_type: torch.utils.data.DataLoader(image_datasets[ds_type], batch_size=batch_size, shuffle=True,
-                                             num_workers=4)
-        for ds_type in ['train', 'val']
-    }
-
-    # imshow(dataloaders_dict['train'][0][0])
+    image_datasets = ImageData('.', 'img_n', ids, y, data_transforms['val'])
+    dataloader = torch.utils.data.DataLoader(image_datasets, batch_size=batch_size, shuffle=True, num_workers=4)
 
     model_ft, input_size = initialize_model(model_name, n_classes, feature_extract, use_pretrained=False)
     model_ft = load_model(model_ft, device, model_file)
-    visualize_model(model_ft, target_column_name, dataloaders_dict, class_names)
+    visualize_model(model_ft, dataloader, class_names, f'model_{target_column_name}_predict_result1.png',
+                    num_images=num_images)
 
 
 if __name__ == '__main__':
     model_name = 'resnet'
-    num_epochs = 3
+    num_epochs = 15
     batch_size = 8
     feature_extract = True
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    LOAD_TRAINED_MODEL = True
+    what_to_do = 'test_trained_model'
+    LOAD_TRAINED_MODEL = False
 
     df = pd.read_excel('products.xlsx')
     df.dropna(inplace=True, subset=['category', 'condition'])
+    target_column = 'condition'
 
-    if LOAD_TRAINED_MODEL:
-        model_file = 'best_model_non_feature_extract.pt'
-        load_and_test_trained_model(model_file, df, 'id', 'category', model_name, num_epochs, batch_size, feature_extract, device)
-    else:
-        get_model_for_target_column(df, 'id', 'category', model_name, num_epochs, batch_size, feature_extract, device)
+    if what_to_do == 'test_trained_model':
+        # tests trained model on a set number of random test images from dataset
+        num_images = 8
+        model_file = f'best_model_{target_column}_feature_extract.pt'
+        load_and_test_trained_model(model_file, 8, 'id', target_column, model_name, batch_size,
+                                    feature_extract, device)
+    elif what_to_do == 'train_model':
+        get_model_for_target_column(df, 'id', target_column, model_name, num_epochs, batch_size, feature_extract, device)
 
 
